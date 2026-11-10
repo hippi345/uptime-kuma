@@ -28,24 +28,24 @@ const {
     RESPONSE_BODY_LENGTH_MAX,
 } = require("../../src/util");
 const {
-    ping,
     checkStatusCode,
     getTotalClientInRoom,
     httpNtlm,
     radius,
     kafkaProducerAsync,
     getOidcTokenClientCredentials,
+    selectMonitorProxyAgent,
     rootCertificatesFingerprints,
     axiosAbortSignal,
     encodeBase64,
     checkCertExpiryNotifications,
-} = require("../util-server");
+} = require("../util");
 const { R } = require("redbean-node");
 const { BeanModel } = require("redbean-node/dist/bean-model");
 const { Notification } = require("../notification");
 const { demoMode } = require("../config");
 const version = require("../../package.json").version;
-const apicache = require("../modules/apicache");
+const apicache = require("../utils/response-cache");
 const { UptimeKumaServer } = require("../uptime-kuma-server");
 const { DockerHost } = require("../docker");
 const crypto = require("crypto");
@@ -65,6 +65,7 @@ const zlib = require("node:zlib");
 const { promisify } = require("node:util");
 const brotliCompress = promisify(zlib.brotliCompress);
 const DomainExpiry = require("./domain_expiry");
+const { monitorConfigSchema } = require("../types");
 
 const rootCertificates = rootCertificatesFingerprints();
 
@@ -188,7 +189,6 @@ class Monitor extends BeanModel {
             httpBodyEncoding: this.httpBodyEncoding,
             jsonPath: this.jsonPath,
             expectedValue: this.expectedValue,
-            system_service_name: this.system_service_name,
             kafkaProducerTopic: this.kafkaProducerTopic,
             kafkaProducerBrokers: JSON.parse(this.kafkaProducerBrokers),
             kafkaProducerSsl: this.getKafkaProducerSsl(),
@@ -220,6 +220,9 @@ class Monitor extends BeanModel {
             saveResponse: this.getSaveResponse(),
             saveErrorResponse: this.getSaveErrorResponse(),
             responseMaxLength: this.response_max_length ?? RESPONSE_BODY_LENGTH_DEFAULT,
+
+            // Extensible per monitor type settings
+            config: this.getConfig(),
         };
 
         if (includeSensitiveData) {
@@ -415,6 +418,59 @@ class Monitor extends BeanModel {
     }
 
     /**
+     * Get the full config
+     * @returns {object} Parsed config, empty object if null or invalid
+     */
+    getConfig() {
+        if (typeof this.config === "object" && this.config !== null) {
+            return this.config;
+        }
+
+        if (!this.config) {
+            return {};
+        }
+
+        try {
+            return JSON.parse(this.config);
+        } catch (e) {
+            log.warn("monitor", `Invalid config JSON for monitor ${this.id}, ignored: ${e.message}`);
+            return {};
+        }
+    }
+
+    /**
+     * Set the full config object
+     * @param {object} config The config object to store
+     * @returns {void}
+     */
+    setConfig(config) {
+        this.config = JSON.stringify(config);
+    }
+
+    /**
+     * Get one config value
+     * @param {string} key The config key to retrieve
+     * @param {*} defaultValue Default value if the key does not exist
+     * @returns {*} The config value or defaultValue
+     */
+    getConfigValue(key, defaultValue = undefined) {
+        const config = this.getConfig();
+        return key in config ? config[key] : defaultValue;
+    }
+
+    /**
+     * Set one config value
+     * @param {string} key The config key to set
+     * @param {*} value The value to store
+     * @returns {void}
+     */
+    setConfigValue(key, value) {
+        const config = this.getConfig();
+        config[key] = value;
+        this.setConfig(config);
+    }
+
+    /**
      * Start monitor
      * @param {Server} io Socket server instance
      * @param {number} firstBeatDelayMs Delay the first check (used to spread startup)
@@ -451,7 +507,7 @@ class Monitor extends BeanModel {
             let tlsInfo = undefined;
 
             if (!previousBeat || this.type === "push") {
-                previousBeat = await R.findOne("heartbeat", " monitor_id = ? ORDER BY time DESC", [this.id]);
+                previousBeat = await R.findOne("heartbeat", " monitor_id = ? ORDER BY id DESC", [this.id]);
                 if (previousBeat) {
                     retries = previousBeat.retries;
                 }
@@ -472,7 +528,7 @@ class Monitor extends BeanModel {
             // Runtime patch timeout if it is 0
             // See https://github.com/louislam/uptime-kuma/pull/3961#issuecomment-1804149144
             if (!this.timeout || this.timeout <= 0) {
-                this.timeout = this.interval * 1000 * 0.8;
+                this.timeout = this.interval * 0.8;
             }
 
             try {
@@ -497,26 +553,6 @@ class Monitor extends BeanModel {
                         bearerAuthHeader = {
                             Authorization: "Bearer " + this.bearer_token,
                         };
-                    }
-
-                    // OIDC: Basic client credential flow.
-                    // Additional grants might be implemented in the future
-                    let oauth2AuthHeader = {};
-                    if (this.auth_method === "oauth2-cc") {
-                        try {
-                            if (
-                                this.oauthAccessToken === undefined ||
-                                new Date(this.oauthAccessToken.expires_at * 1000) <= new Date()
-                            ) {
-                                this.oauthAccessToken = await this.makeOidcTokenClientCredentialsRequest();
-                            }
-                            oauth2AuthHeader = {
-                                Authorization:
-                                    this.oauthAccessToken.token_type + " " + this.oauthAccessToken.access_token,
-                            };
-                        } catch (e) {
-                            throw new Error("The oauth config is invalid. " + e.message);
-                        }
                     }
 
                     let agentFamily = undefined;
@@ -573,7 +609,6 @@ class Monitor extends BeanModel {
                             ...(contentType ? { "Content-Type": contentType } : {}),
                             ...basicAuthHeader,
                             ...bearerAuthHeader,
-                            ...oauth2AuthHeader,
                             ...(this.headers ? JSON.parse(this.headers) : {}),
                         },
                         maxRedirects: this.maxredirects,
@@ -608,6 +643,32 @@ class Monitor extends BeanModel {
 
                     options.httpAgent = agents.httpAgent;
                     options.httpsAgent = agents.httpsAgent;
+
+                    // OIDC: Basic client credential flow.
+                    // Additional grants might be implemented in the future.
+                    // The token request uses the monitor's proxy agent so it leaves
+                    // through the same proxy as the check itself.
+                    if (this.auth_method === "oauth2-cc") {
+                        try {
+                            if (
+                                this.oauthAccessToken === undefined ||
+                                new Date(this.oauthAccessToken.expires_at * 1000) <= new Date()
+                            ) {
+                                this.oauthAccessToken = await this.makeOidcTokenClientCredentialsRequest(
+                                    selectMonitorProxyAgent(this.oauth_token_url, agents)
+                                );
+                            }
+                            const customHeaders = this.headers ? JSON.parse(this.headers) : {};
+                            options.headers = {
+                                ...options.headers,
+                                Authorization:
+                                    this.oauthAccessToken.token_type + " " + this.oauthAccessToken.access_token,
+                                ...customHeaders,
+                            };
+                        } catch (e) {
+                            throw new Error("The oauth config is invalid. " + e.message);
+                        }
+                    }
 
                     if (this.auth_method === "mtls") {
                         if (this.tlsCert !== null && this.tlsCert !== "") {
@@ -706,18 +767,6 @@ class Monitor extends BeanModel {
                             );
                         }
                     }
-                } else if (this.type === "ping") {
-                    bean.ping = await ping(
-                        this.hostname,
-                        this.ping_count,
-                        "",
-                        this.ping_numeric,
-                        this.packetSize,
-                        this.timeout,
-                        this.ping_per_request_timeout
-                    );
-                    bean.msg = "";
-                    bean.status = UP;
                 } else if (this.type === "push") {
                     // Type: Push
                     log.debug(
@@ -1158,7 +1207,13 @@ class Monitor extends BeanModel {
              * the recent api request failed for authentication purposes
              */
             if (this.auth_method === "oauth2-cc" && error.response.status === 401 && !finalCall) {
-                this.oauthAccessToken = await this.makeOidcTokenClientCredentialsRequest();
+                this.oauthAccessToken = await this.makeOidcTokenClientCredentialsRequest(
+                    selectMonitorProxyAgent(this.oauth_token_url, {
+                        proxied: options.proxy === false,
+                        httpAgent: options.httpAgent,
+                        httpsAgent: options.httpsAgent,
+                    })
+                );
                 let oauth2AuthHeader = {
                     Authorization: this.oauthAccessToken.token_type + " " + this.oauthAccessToken.access_token,
                 };
@@ -1276,6 +1331,28 @@ class Monitor extends BeanModel {
         await R.store(tlsInfoBean);
 
         return checkCertificateResult;
+    }
+
+    /**
+     * Write the client writable config keys, one key at a time
+     * @param {object} raw Config payload from the client
+     * @returns {void}
+     * @throws {Error} If a known key has the wrong type
+     */
+    applyClientConfig(raw) {
+        if (!raw) {
+            return;
+        }
+
+        const result = monitorConfigSchema.safeParse(raw);
+
+        if (!result.success) {
+            throw new Error(result.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`).join("; "));
+        }
+
+        for (const [key, value] of Object.entries(result.data)) {
+            this.setConfigValue(key, value);
+        }
     }
 
     /**
@@ -1674,19 +1751,20 @@ class Monitor extends BeanModel {
         }
 
         if (["system-service", "pm2"].includes(this.type)) {
-            this.system_service_name = (this.system_service_name || "").trim();
+            const serviceName = (this.getConfigValue("systemServiceName") || "").trim();
+            this.setConfigValue("systemServiceName", serviceName);
 
-            if (!this.system_service_name) {
+            if (!serviceName) {
                 throw new Error(this.type === "pm2" ? "PM2 process name is required." : "Service Name is required.");
             }
-        }
 
-        if (this.type === "system-service" && !/^[a-zA-Z0-9._\-@]+$/.test(this.system_service_name)) {
-            throw new Error("Invalid service name. Please use the internal Service Name (no spaces).");
-        }
+            if (this.type === "system-service" && !/^[a-zA-Z0-9._\-@]+$/.test(serviceName)) {
+                throw new Error("Invalid service name. Please use the internal Service Name (no spaces).");
+            }
 
-        if (this.type === "pm2" && /[\u0000-\u001F\u007F]/.test(this.system_service_name)) {
-            throw new Error("Invalid PM2 process name.");
+            if (this.type === "pm2" && /[\u0000-\u001F\u007F]/.test(serviceName)) {
+                throw new Error("Invalid PM2 process name.");
+            }
         }
 
         if (this.type === "ping") {
@@ -2095,9 +2173,10 @@ class Monitor extends BeanModel {
 
     /**
      * Obtains a new Oidc Token
+     * @param {import("http").Agent} agent Proxy agent shared with the monitor request
      * @returns {Promise<object>} OAuthProvider client
      */
-    async makeOidcTokenClientCredentialsRequest() {
+    async makeOidcTokenClientCredentialsRequest(agent) {
         log.debug("monitor", `[${this.name}] The oauth access-token undefined or expired. Requesting a new token`);
         const oAuthAccessToken = await getOidcTokenClientCredentials(
             this.oauth_token_url,
@@ -2105,7 +2184,8 @@ class Monitor extends BeanModel {
             this.oauth_client_secret,
             this.oauth_scopes,
             this.oauth_audience,
-            this.oauth_auth_method
+            this.oauth_auth_method,
+            agent
         );
         if (this.oauthAccessToken?.expires_at) {
             log.debug(
